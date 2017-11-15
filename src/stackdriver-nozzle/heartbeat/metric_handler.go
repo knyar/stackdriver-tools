@@ -74,11 +74,12 @@ func (h *metricHandler) Flush() {
 	for k, v := range counter {
 		metrics = append(metrics, &messages.Metric{
 			Name:      "heartbeat." + k,
+			Labels:    labels,
 			Value:     float64(v),
 			EventTime: t,
 		})
 	}
-	h.ma.PostMetricEvents([]*messages.MetricEvent{{Labels: labels, Metrics: metrics}})
+	h.ma.PostMetrics(metrics)
 }
 
 func (h *metricHandler) flushInternal() map[string]uint {

@@ -36,7 +36,7 @@ type autoCulledMetricsBuffer struct {
 	heartbeater heartbeat.Heartbeater
 
 	metricsMu sync.Mutex // Guard metrics
-	metrics   map[string]*messages.MetricEvent
+	metrics   map[string]*messages.Metric
 }
 
 // NewAutoCulledMetricsBuffer provides a MetricsBuffer that will cull like metrics over the defined frequency.
@@ -45,7 +45,7 @@ func NewAutoCulledMetricsBuffer(ctx context.Context, logger lager.Logger, freque
 	adapter stackdriver.MetricAdapter, heartbeater heartbeat.Heartbeater) MetricsBuffer {
 	mb := &autoCulledMetricsBuffer{
 		adapter:     adapter,
-		metrics:     make(map[string]*messages.MetricEvent),
+		metrics:     make(map[string]*messages.Metric),
 		ctx:         ctx,
 		logger:      logger,
 		ticker:      time.NewTicker(frequency),
@@ -55,22 +55,22 @@ func NewAutoCulledMetricsBuffer(ctx context.Context, logger lager.Logger, freque
 	return mb
 }
 
-func (mb *autoCulledMetricsBuffer) PostMetricEvents(events []*messages.MetricEvent) {
+func (mb *autoCulledMetricsBuffer) PostMetrics(metrics []*messages.Metric) {
 	mb.metricsMu.Lock()
 	defer mb.metricsMu.Unlock()
 
-	for _, event := range events {
-		hash := event.Hash()
+	for _, metric := range metrics {
+		hash := metric.Hash()
 		old, exists := mb.metrics[hash]
 		if !exists {
-			mb.metrics[hash] = event
+			mb.metrics[hash] = metric
 		} else {
-			mb.heartbeater.Increment("metrics.events.sampled")
-			if event.Metrics[0].EventTime.After(old.Metrics[0].EventTime) {
+			mb.heartbeater.Increment("metrics.sampled")
+			if metric.EventTime.After(old.EventTime) {
 				// Firehose messages are not guaranteed to be received in
 				// timestamp order, so only overwrite the sampled metric
 				// if the event is newer.
-				mb.metrics[hash] = event
+				mb.metrics[hash] = metric
 			}
 		}
 	}
@@ -81,22 +81,22 @@ func (mb *autoCulledMetricsBuffer) IsEmpty() bool {
 }
 
 func (mb *autoCulledMetricsBuffer) flush() {
-	mb.adapter.PostMetricEvents(mb.flushInternalBuffer())
+	mb.adapter.PostMetrics(mb.flushInternalBuffer())
 }
 
-func (mb *autoCulledMetricsBuffer) flushInternalBuffer() []*messages.MetricEvent {
+func (mb *autoCulledMetricsBuffer) flushInternalBuffer() []*messages.Metric {
 	mb.metricsMu.Lock()
 	defer mb.metricsMu.Unlock()
 	mb.logger.Info("autoCulledMetricsBuffer", lager.Data{"info": fmt.Sprintf("Flushing %v metrics", len(mb.metrics))})
 
-	events := make([]*messages.MetricEvent, 0, len(mb.metrics))
+	metrics := make([]*messages.Metric, 0, len(mb.metrics))
 	for _, v := range mb.metrics {
-		events = append(events, v)
+		metrics = append(metrics, v)
 	}
 
-	mb.metrics = make(map[string]*messages.MetricEvent)
+	mb.metrics = make(map[string]*messages.Metric)
 
-	return events
+	return metrics
 }
 
 func (mb *autoCulledMetricsBuffer) start() {

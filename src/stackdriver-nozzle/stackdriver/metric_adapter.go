@@ -33,7 +33,7 @@ import (
 )
 
 type MetricAdapter interface {
-	PostMetricEvents([]*messages.MetricEvent)
+	PostMetrics([]*messages.Metric)
 }
 
 type Heartbeater interface {
@@ -69,14 +69,14 @@ func NewMetricAdapter(projectID string, client MetricClient, batchSize int, hear
 	return ma, err
 }
 
-func (ma *metricAdapter) PostMetricEvents(events []*messages.MetricEvent) {
-	series := ma.buildTimeSeries(events)
+func (ma *metricAdapter) PostMetrics(metrics []*messages.Metric) {
+	series := ma.buildTimeSeries(metrics)
 	projectName := path.Join("projects", ma.projectID)
 
 	count := len(series)
 	chunks := int(math.Ceil(float64(count) / float64(ma.batchSize)))
 
-	ma.logger.Info("metricAdapter.PostMetricEvents", lager.Data{"info": "Posting TimeSeries to Stackdriver", "count": count, "chunks": chunks})
+	ma.logger.Info("metricAdapter.PostMetrics", lager.Data{"info": "Posting TimeSeries to Stackdriver", "count": count, "chunks": chunks})
 	var low, high int
 	for i := 0; i < chunks; i++ {
 		low = i * ma.batchSize
@@ -104,7 +104,7 @@ func (ma *metricAdapter) PostMetricEvents(events []*messages.MetricEvent) {
 				ma.heartbeater.Increment("metrics.post.errors.out_of_order")
 			} else {
 				ma.heartbeater.Increment("metrics.post.errors.unknown")
-				ma.logger.Error("metricAdapter.PostMetricEvents", err, lager.Data{"info": "Unexpected Error", "request": request})
+				ma.logger.Error("metricAdapter.PostMetrics", err, lager.Data{"info": "Unexpected Error", "request": request})
 			}
 		}
 	}
@@ -112,46 +112,39 @@ func (ma *metricAdapter) PostMetricEvents(events []*messages.MetricEvent) {
 	return
 }
 
-func (ma *metricAdapter) buildTimeSeries(events []*messages.MetricEvent) []*monitoringpb.TimeSeries {
+func (ma *metricAdapter) buildTimeSeries(metrics []*messages.Metric) []*monitoringpb.TimeSeries {
 	var timeSerieses []*monitoringpb.TimeSeries
 
-	for _, event := range events {
-		if len(event.Metrics) == 0 {
+	for _, metric := range metrics {
+		ma.heartbeater.Increment("metrics.timeseries.count")
+		err := ma.ensureMetricDescriptor(metric)
+		if err != nil {
+			ma.logger.Error("metricAdapter.buildTimeSeries", err, lager.Data{"metric": metric})
+			ma.heartbeater.IncrementBy("metrics.metric_descriptor.errors", 1)
 			continue
 		}
 
-		ma.heartbeater.Increment("metrics.events.count")
-		for _, metric := range event.Metrics {
-			ma.heartbeater.Increment("metrics.timeseries.count")
-			err := ma.ensureMetricDescriptor(metric, event.Labels)
-			if err != nil {
-				ma.logger.Error("metricAdapter.buildTimeSeries", err, lager.Data{"metric": metric, "labels": event.Labels})
-				ma.heartbeater.IncrementBy("metrics.metric_descriptor.errors", 1)
-				continue
-			}
-
-			metricType := path.Join("custom.googleapis.com", metric.Name)
-			timeSeries := monitoringpb.TimeSeries{
-				Metric: &metricpb.Metric{
-					Type:   metricType,
-					Labels: event.Labels,
-				},
-				Points: points(metric.Value, metric.EventTime),
-			}
-			timeSerieses = append(timeSerieses, &timeSeries)
+		metricType := path.Join("custom.googleapis.com", metric.Name)
+		timeSeries := monitoringpb.TimeSeries{
+			Metric: &metricpb.Metric{
+				Type:   metricType,
+				Labels: metric.Labels,
+			},
+			Points: points(metric.Value, metric.EventTime),
 		}
+		timeSerieses = append(timeSerieses, &timeSeries)
 	}
 
 	return timeSerieses
 }
 
-func (ma *metricAdapter) CreateMetricDescriptor(metric *messages.Metric, labels map[string]string) error {
+func (ma *metricAdapter) CreateMetricDescriptor(metric *messages.Metric) error {
 	projectName := path.Join("projects", ma.projectID)
 	metricType := path.Join("custom.googleapis.com", metric.Name)
 	metricName := path.Join(projectName, "metricDescriptors", metricType)
 
 	var labelDescriptors []*labelpb.LabelDescriptor
-	for key := range labels {
+	for key := range metric.Labels {
 		labelDescriptors = append(labelDescriptors, &labelpb.LabelDescriptor{
 			Key:       key,
 			ValueType: labelpb.LabelDescriptor_STRING,
@@ -192,7 +185,7 @@ func (ma *metricAdapter) fetchMetricDescriptorNames() error {
 	return nil
 }
 
-func (ma *metricAdapter) ensureMetricDescriptor(metric *messages.Metric, labels map[string]string) error {
+func (ma *metricAdapter) ensureMetricDescriptor(metric *messages.Metric) error {
 	if metric.Unit == "" {
 		return nil
 	}
@@ -204,7 +197,7 @@ func (ma *metricAdapter) ensureMetricDescriptor(metric *messages.Metric, labels 
 		return nil
 	}
 
-	err := ma.CreateMetricDescriptor(metric, labels)
+	err := ma.CreateMetricDescriptor(metric)
 	if err != nil {
 		return err
 	}
