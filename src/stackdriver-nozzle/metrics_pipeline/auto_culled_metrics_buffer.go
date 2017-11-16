@@ -37,6 +37,8 @@ type autoCulledMetricsBuffer struct {
 
 	metricsMu sync.Mutex // Guard metrics
 	metrics   map[string]*messages.Metric
+	// metricTime stores the last seen timestamp for a metric and is used to discard out-of-order points.
+	metricTime map[string]*time.Time
 }
 
 // NewAutoCulledMetricsBuffer provides a MetricsBuffer that will cull like metrics over the defined frequency.
@@ -50,6 +52,7 @@ func NewAutoCulledMetricsBuffer(ctx context.Context, logger lager.Logger, freque
 		logger:      logger,
 		ticker:      time.NewTicker(frequency),
 		heartbeater: heartbeater,
+		metricTime:  map[string]*time.Time{},
 	}
 	mb.start()
 	return mb
@@ -61,18 +64,17 @@ func (mb *autoCulledMetricsBuffer) PostMetrics(metrics []*messages.Metric) {
 
 	for _, metric := range metrics {
 		hash := metric.Hash()
-		old, exists := mb.metrics[hash]
-		if !exists {
-			mb.metrics[hash] = metric
-		} else {
+		if ts, seen := mb.metricTime[hash]; seen && ts.After(metric.EventTime) {
+			// We've already seen a newer point for this metric.
 			mb.heartbeater.Increment("metrics.sampled")
-			if metric.EventTime.After(old.EventTime) {
-				// Firehose messages are not guaranteed to be received in
-				// timestamp order, so only overwrite the sampled metric
-				// if the event is newer.
-				mb.metrics[hash] = metric
-			}
+			continue
+		} else {
+			mb.metricTime[hash] = &metric.EventTime
 		}
+		if _, exists := mb.metrics[hash]; exists {
+			mb.heartbeater.Increment("metrics.sampled")
+		}
+		mb.metrics[hash] = metric
 	}
 }
 

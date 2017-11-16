@@ -43,6 +43,12 @@ type Heartbeater interface {
 	Stop()
 }
 
+type counterState struct {
+	startTime  time.Time
+	lastValue  float64
+	totalValue float64
+}
+
 type metricAdapter struct {
 	projectID             string
 	client                MetricClient
@@ -51,6 +57,8 @@ type metricAdapter struct {
 	batchSize             int
 	logger                lager.Logger
 	heartbeater           Heartbeater
+	counters              map[string]*counterState
+	countersMutex         *sync.Mutex
 }
 
 // NewMetricAdapter returns a MetricAdapater that can write to Stackdriver Monitoring
@@ -63,6 +71,8 @@ func NewMetricAdapter(projectID string, client MetricClient, batchSize int, hear
 		batchSize:             batchSize,
 		logger:                logger,
 		heartbeater:           heartbeater,
+		counters:              map[string]*counterState{},
+		countersMutex:         &sync.Mutex{},
 	}
 
 	err := ma.fetchMetricDescriptorNames()
@@ -123,19 +133,52 @@ func (ma *metricAdapter) buildTimeSeries(metrics []*messages.Metric) []*monitori
 			ma.heartbeater.IncrementBy("metrics.metric_descriptor.errors", 1)
 			continue
 		}
-
-		metricType := path.Join("custom.googleapis.com", metric.Name)
-		timeSeries := monitoringpb.TimeSeries{
-			Metric: &metricpb.Metric{
-				Type:   metricType,
-				Labels: metric.Labels,
-			},
-			Points: points(metric.Value, metric.EventTime),
+		if ts := ma.createTimeSeries(metric); ts != nil {
+			timeSerieses = append(timeSerieses, ts)
 		}
-		timeSerieses = append(timeSerieses, &timeSeries)
 	}
 
 	return timeSerieses
+}
+
+func (ma *metricAdapter) createTimeSeries(metric *messages.Metric) *monitoringpb.TimeSeries {
+	metricType := path.Join("custom.googleapis.com", metric.Name)
+	var point *monitoringpb.Point
+	if metric.IsCumulative() {
+		// this is a counter
+		ma.countersMutex.Lock()
+		defer ma.countersMutex.Unlock()
+		hash := metric.Hash()
+		counter, present := ma.counters[hash]
+		if !present {
+			// Initialize counter state for a new counter
+			ma.counters[hash] = &counterState{
+				lastValue:  metric.Value,
+				totalValue: 0,
+				startTime:  time.Now(),
+			}
+			return nil
+		}
+
+		if counter.lastValue > metric.Value {
+			// Counter has been reset.
+			counter.totalValue += metric.Value
+		} else {
+			counter.totalValue += (metric.Value - counter.lastValue)
+		}
+		counter.lastValue = metric.Value
+		point = createPoint(counter.totalValue, counter.startTime, metric.EventTime)
+	} else {
+		// A gauge metric, startTime == endTime.
+		point = createPoint(metric.Value, metric.EventTime, metric.EventTime)
+	}
+	return &monitoringpb.TimeSeries{
+		Metric: &metricpb.Metric{
+			Type:   metricType,
+			Labels: metric.Labels,
+		},
+		Points: []*monitoringpb.Point{point},
+	}
 }
 
 func (ma *metricAdapter) CreateMetricDescriptor(metric *messages.Metric) error {
@@ -151,13 +194,17 @@ func (ma *metricAdapter) CreateMetricDescriptor(metric *messages.Metric) error {
 		})
 	}
 
+	metricKind := metricpb.MetricDescriptor_GAUGE
+	if metric.IsCumulative() {
+		metricKind = metricpb.MetricDescriptor_CUMULATIVE
+	}
 	req := &monitoringpb.CreateMetricDescriptorRequest{
 		Name: projectName,
 		MetricDescriptor: &metricpb.MetricDescriptor{
 			Name:        metricName,
 			Type:        metricType,
 			Labels:      labelDescriptors,
-			MetricKind:  metricpb.MetricDescriptor_GAUGE,
+			MetricKind:  metricKind,
 			ValueType:   metricpb.MetricDescriptor_DOUBLE,
 			Unit:        metric.Unit,
 			Description: "stackdriver-nozzle created custom metric.",
@@ -186,7 +233,8 @@ func (ma *metricAdapter) fetchMetricDescriptorNames() error {
 }
 
 func (ma *metricAdapter) ensureMetricDescriptor(metric *messages.Metric) error {
-	if metric.Unit == "" {
+	// Only create descriptors explicitly if we need to provide a unit or override metric kind.
+	if metric.Unit == "" && !metric.IsCumulative() {
 		return nil
 	}
 
@@ -205,15 +253,11 @@ func (ma *metricAdapter) ensureMetricDescriptor(metric *messages.Metric) error {
 	return nil
 }
 
-func points(value float64, eventTime time.Time) []*monitoringpb.Point {
-	timeStamp := timestamp.Timestamp{
-		Seconds: eventTime.Unix(),
-		Nanos:   int32(eventTime.Nanosecond()),
-	}
-	point := &monitoringpb.Point{
+func createPoint(value float64, startTime time.Time, endTime time.Time) *monitoringpb.Point {
+	return &monitoringpb.Point{
 		Interval: &monitoringpb.TimeInterval{
-			EndTime:   &timeStamp,
-			StartTime: &timeStamp,
+			StartTime: &timestamp.Timestamp{Seconds: startTime.Unix(), Nanos: int32(startTime.Nanosecond())},
+			EndTime:   &timestamp.Timestamp{Seconds: endTime.Unix(), Nanos: int32(endTime.Nanosecond())},
 		},
 		Value: &monitoringpb.TypedValue{
 			Value: &monitoringpb.TypedValue_DoubleValue{
@@ -221,5 +265,4 @@ func points(value float64, eventTime time.Time) []*monitoringpb.Point {
 			},
 		},
 	}
-	return []*monitoringpb.Point{point}
 }

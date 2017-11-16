@@ -3,6 +3,7 @@ package messages
 import (
 	"bytes"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cloudfoundry/sonde-go/events"
@@ -34,4 +35,8 @@ func (m *Metric) Hash() string {
 		b.Write([]byte(m.Labels[k]))
 	}
 	return b.String()
+}
+
+func (m *Metric) IsCumulative() bool {
+	return m.Type == events.Envelope_CounterEvent && strings.HasSuffix(m.Name, ".total")
 }
